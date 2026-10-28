@@ -7,12 +7,14 @@
 运行：python trae_pet.py   （或双击 start_pet.bat）
 依赖：PyQt5  (pip install PyQt5)
 """
+import base64
 import datetime
 import glob
 import json
 import math
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -23,7 +25,8 @@ import urllib.request
 from PyQt5.QtCore import QPoint, QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import (QColor, QCursor, QFont, QLinearGradient, QPainter,
                          QPainterPath, QPen, QPixmap, QPolygonF, QRadialGradient)
-from PyQt5.QtWidgets import QApplication, QFileDialog, QLineEdit, QMenu, QWidget
+from PyQt5.QtWidgets import (QApplication, QFileDialog, QLineEdit, QMenu,
+                             QPushButton, QWidget)
 
 W, H = 300, 330
 CX = W // 2
@@ -120,6 +123,111 @@ WAKE_LINES = ["睡醒啦！精神满满的～", "唔……这一觉睡得好香�
 
 # 眼睛盯鼠标：idle 立绘上两眼中心的 widget 坐标（实测）
 EYE_POS = ((121, 178), (173, 178))
+
+# ---------------- Trae 积分监控 ----------------
+# 凭证来自浏览器 localStorage 里的 Cloud-IDE-Token（QQ 浏览器/Chrome/Edge 均可）
+CREDITS_TOKEN_KEY = "Cloud-IDE-Token"
+CREDITS_API = "https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage"
+# 该接口会校验 UA 指纹：必须与浏览器一致，否则一律 401
+CREDITS_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/138.0.7204.0 Safari/537.36")
+CREDITS_WARN = 500                    # 余额低于这个值主动提醒
+CREDITS_SYNC_MS = 30 * 60 * 1000      # 后台自动同步间隔（30 分钟）
+CREDITS_LOW_LINES = ["积分快见底啦，省着点用……", "余额不多了哦，要不要去签到领一点？",
+                     "钱包要空了，记得补积分呀"]
+CREDITS_DOWN_LINES = ["涨啦！积分到账～", "有新积分进来了，收好～", "余额往上走了，开心！"]
+CREDITS_UP_LINES = ["积分被吃掉了一些……", "刚才那波消耗不小呀", "积分在减少，注意节奏哦"]
+CREDITS_ERR_LINES = ["没拿到积分数据……浏览器可能没登录 trae.cn", "读不到凭证，先在浏览器里登录一下 trae.cn 吧",
+                     "同步失败了，等下再试试～"]
+
+# 搜索框右侧「Trae」按钮：唤起本机 Trae IDE
+TRAE_SCHEME = "trae-cn://"
+TRAE_EXE = r"D:\Program Files\Trae CN\Trae CN.exe"
+
+
+def _browser_storage_dirs():
+    """可能存有 trae.cn localStorage 的 leveldb 目录（QQ 浏览器 / Chrome / Edge，含多 profile）。"""
+    local = os.environ.get("LOCALAPPDATA")
+    roots = [os.path.join(local, r"Tencent\QQBrowser\User Data"),
+             os.path.join(local, r"Google\Chrome\User Data"),
+             os.path.join(local, r"Microsoft\Edge\User Data")]
+    dirs = []
+    for r in roots:
+        dirs.extend(glob.glob(os.path.join(r, "*", "Local Storage", "leveldb")))
+    return dirs
+
+
+_JWT_RE = re.compile(rb"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+")
+
+
+def _jwt_exp(tok):
+    """取 JWT 的 exp（秒级时间戳）；解析失败返回 0。"""
+    try:
+        p = tok.split(".")[1]
+        p += "=" * (-len(p) % 4)
+        return int(json.loads(base64.urlsafe_b64decode(p)).get("exp") or 0)
+    except (ValueError, TypeError, KeyError, IndexError):
+        return 0
+
+
+def read_trae_token():
+    """从浏览器 localStorage 的 leveldb 里取 trae.cn 的 Cloud-IDE-Token（JWT）。
+
+    浏览器用的是追加写的日志文件，同一个 key 会留下历史值的碎片，
+    而且多个浏览器可能共存，所以按 exp 取最新那个，而不是看文件时间。
+    """
+    best = None                      # (exp, token)
+    for d in _browser_storage_dirs():
+        try:
+            files = glob.glob(os.path.join(d, "*.ldb")) + glob.glob(os.path.join(d, "*.log"))
+        except OSError:
+            continue
+        for fp in files:
+            try:
+                data = open(fp, "rb").read()
+            except OSError:
+                continue            # 浏览器正在写，跳过这个文件
+            if CREDITS_TOKEN_KEY.encode() not in data:
+                continue
+            for m in _JWT_RE.findall(data):
+                tok = m.decode("ascii", "ignore")
+                e = _jwt_exp(tok)
+                if best is None or e > best[0]:
+                    best = (e, tok)
+    return best[1] if best else None
+
+
+def fetch_credits(timeout=15):
+    """拉取 Trae 积分余额。成功返回 dict，失败抛异常。"""
+    token = read_trae_token()
+    if not token:
+        raise RuntimeError("未找到 Cloud-IDE-Token，请先在浏览器登录 trae.cn")
+    if _jwt_exp(token) < time.time():
+        raise RuntimeError("浏览器里的登录凭证过期了，去 trae.cn 刷新一下")
+    req = urllib.request.Request(
+        CREDITS_API, data=b'{"require_usage": true}', method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Cloud-IDE-JWT " + token,
+                 "User-Agent": CREDITS_UA,
+                 "Origin": "https://www.trae.cn",
+                 "Referer": "https://www.trae.cn/"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        d = json.loads(resp.read().decode("utf-8", "ignore"))
+    summ = d.get("usage_summary") or {}
+    total = float(summ.get("total_amount") or 0)
+    used = float(summ.get("consumed_amount") or 0)
+    packs = []
+    for p in d.get("user_entitlement_pack_list") or []:
+        q = (p.get("entitlement_base_info") or {}).get("quota") or {}
+        limit = float(q.get("credits_limit") or 0)
+        if limit <= 0:
+            continue
+        packs.append({"name": p.get("group_name") or p.get("display_desc") or "积分包",
+                      "limit": limit,
+                      "used": float((p.get("usage") or {}).get("credits_amount") or 0)})
+    return {"balance": round(total - used, 2), "total": total,
+            "used": round(used, 2), "packs": packs, "ts": time.time()}
+
 
 # ---------------- 性格系统 ----------------
 PERSONALITIES = {
@@ -606,6 +714,7 @@ class DesktopPet(QWidget):
     weather_ready = pyqtSignal(dict)
     skin_ready = pyqtSignal(object)
     skin_progress = pyqtSignal(str)
+    credits_ready = pyqtSignal(object)      # (data|None, manual)
 
     def __init__(self):
         super().__init__()
@@ -686,6 +795,16 @@ class DesktopPet(QWidget):
         self._weather_alert_day = ""
         self.weather_ready.connect(self._on_weather)
 
+        # ---- Trae 积分监控 ----
+        self.credits = None              # {balance,total,used,packs,ts}
+        self._credits_busy = False
+        self._credits_warned = False
+        self._credits_err = ""           # 最近一次同步失败的原因
+        self.credits_ready.connect(self._on_credits)
+        self.credits_timer = QTimer(self, timeout=self._sync_credits)
+        self.credits_timer.start(CREDITS_SYNC_MS)
+        QTimer.singleShot(9000, self._sync_credits)
+
         # ---- growth state ----
         self.xp = 0
         self.mood = 80
@@ -726,14 +845,29 @@ class DesktopPet(QWidget):
         self.proactive_timer.start(60000)              # 主动问候/需求/天气
         QTimer.singleShot(25000, self._fetch_weather_async)
 
-        # ---- 悬停小对话框（问小T，默认用系统浏览器搜索）----
+        # ---- 悬停小对话框（回车=浏览器搜索，右侧可切 Trae / 网页）----
         edit_ss = ("QLineEdit{background:rgba(255,255,255,235);border:2px solid #4FA8EF;"
                    "border-radius:13px;padding:0 10px;font:9pt 'Microsoft YaHei';color:#1F3B4D}")
         self.chat_edit = QLineEdit(self)
         self.chat_edit.setPlaceholderText("问我点什么…")
-        self.chat_edit.setGeometry(16, 264, 268, 26)
+        self.chat_edit.setGeometry(16, 264, 186, 26)
         self.chat_edit.setStyleSheet(edit_ss)
         self.chat_edit.returnPressed.connect(self._ask)
+        btn_ss = ("QPushButton{background:rgba(255,255,255,235);border:2px solid #4FA8EF;"
+                  "border-radius:13px;font:8pt 'Microsoft YaHei';color:#1F3B4D}"
+                  "QPushButton:hover{background:#4FA8EF;color:#FFFFFF}")
+        self.trae_btn = QPushButton("Trae", self)
+        self.trae_btn.setGeometry(208, 264, 40, 26)
+        self.trae_btn.setStyleSheet(btn_ss)
+        self.trae_btn.setCursor(Qt.PointingHandCursor)
+        self.trae_btn.setToolTip("唤起本机 Trae IDE")
+        self.trae_btn.clicked.connect(self._ask_trae)
+        self.web_btn = QPushButton("网页", self)
+        self.web_btn.setGeometry(252, 264, 32, 26)
+        self.web_btn.setStyleSheet(btn_ss)
+        self.web_btn.setCursor(Qt.PointingHandCursor)
+        self.web_btn.setToolTip("用默认浏览器搜索")
+        self.web_btn.clicked.connect(self._ask_web)
         self._set_chat_visible(False)
 
         self._update_tooltip()
@@ -757,6 +891,9 @@ class DesktopPet(QWidget):
             if d.get("persona") in PERSONALITIES:
                 self.persona = d["persona"]
             self.skin_path = d.get("skin")
+            c = d.get("credits")
+            if isinstance(c, dict) and "balance" in c:
+                self.credits = c
         except (OSError, ValueError):
             self.visits = 1
         self._save()
@@ -766,6 +903,7 @@ class DesktopPet(QWidget):
             "xp": self.xp, "mood": self.mood, "satiety": self.satiety,
             "counts": self.counts, "achievements": sorted(self.achievements),
             "visits": self.visits, "persona": self.persona, "skin": self.skin_path,
+            "credits": self.credits,
         }
         try:
             with open(SAVE_PATH, "w", encoding="utf-8") as f:
@@ -1410,19 +1548,111 @@ class DesktopPet(QWidget):
             self.talk(f"外面要下{kind}啦（{d['desc']} {d['temp']}°C）\n出门记得带伞哦！",
                       force=True)
 
+    # ---------------- Trae 积分 ----------------
+    def _sync_credits(self, manual=False):
+        """后台拉取积分；manual=True 时无论成败都会反馈。"""
+        if self._credits_busy:
+            return
+        self._credits_busy = True
+
+        def work():
+            err = ""
+            try:
+                data = fetch_credits()
+            except Exception as e:
+                data, err = None, str(e)
+            self._credits_err = err
+            self._credits_busy = False
+            self.credits_ready.emit((data, manual))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_credits(self, payload):
+        data, manual = payload
+        if not data:
+            if manual:
+                self.talk(self._credits_err or random.choice(CREDITS_ERR_LINES), force=True)
+            return
+        old = self.credits
+        self.credits = data
+        self._save()
+        bal = data["balance"]
+        if bal < CREDITS_WARN:
+            if not self._credits_warned:
+                self._credits_warned = True
+                self.talk(f"积分只剩 {bal:.0f} 了，{random.choice(CREDITS_LOW_LINES)}", force=True)
+            return
+        self._credits_warned = False
+        if manual:
+            self.talk(f"积分 {bal:.0f} / {data['total']:.0f}（已用 {data['used']:.0f}）", force=True)
+        elif old and "balance" in old:
+            delta = bal - float(old["balance"])
+            if delta >= 1:
+                self.talk(f"{random.choice(CREDITS_DOWN_LINES)} +{delta:.0f}，现在 {bal:.0f}", force=True)
+            elif delta <= -1:
+                self.talk(f"{random.choice(CREDITS_UP_LINES)} -{abs(delta):.0f}，还剩 {bal:.0f}",
+                          force=True)
+
+    def show_credits(self):
+        """积分面板：余额 + 最近更新 + 各积分包剩余。"""
+        c = self.credits
+        if not c:
+            self.talk("还没有积分数据，正在同步……", force=True)
+            self._sync_credits(manual=True)
+            return
+        when = time.strftime("%m-%d %H:%M", time.localtime(c.get("ts", time.time())))
+        lines = [f"积分余额 {c['balance']:.0f} / {c['total']:.0f}",
+                 f"已用 {c['used']:.0f}　更新 {when}"]
+        for p in c.get("packs", [])[:4]:
+            lines.append(f"· {p['name']} {p['limit'] - p['used']:.0f}/{p['limit']:.0f}")
+        if c["balance"] < CREDITS_WARN:
+            lines.append("余额偏低，记得去签到补一点")
+        self.talk("\n".join(lines), force=True)
+
     # ---------------- 悬停小对话框 ----------------
     def _set_chat_visible(self, v):
         # 倒地/被拎起时不显示输入框（子控件会盖住躺在地上的头）
         show = v and not self.dragging and not self._down_state
         self.chat_edit.setVisible(show)
+        self.trae_btn.setVisible(show)
+        self.web_btn.setVisible(show)
 
     def _ask(self):
+        """回车：用系统默认浏览器搜索。"""
         q = self.chat_edit.text().strip()
         if not q:
             return
         self.chat_edit.clear()
         os.startfile("https://www.bing.com/search?q=" + urllib.parse.quote(q))
         self.talk("已打开浏览器帮你搜啦", force=True)
+
+    def _ask_trae(self):
+        """唤起本机 Trae IDE，并把问题放进剪贴板方便直接粘贴。"""
+        q = self.chat_edit.text().strip()
+        if q:
+            QApplication.clipboard().setText(q)
+        launched = False
+        try:
+            os.startfile(TRAE_SCHEME)
+            launched = True
+        except OSError:
+            if os.path.exists(TRAE_EXE):
+                try:
+                    os.startfile(TRAE_EXE)
+                    launched = True
+                except OSError:
+                    pass
+        self.chat_edit.clear()
+        if q and launched:
+            self.talk("Trae 已打开，问题复制到剪贴板了，Ctrl+V 问它吧", force=True)
+        elif launched:
+            self.talk("Trae 已经喊出来了～", force=True)
+        else:
+            self.talk("没找到 Trae，装一个再来找我吧", force=True)
+
+    def _ask_web(self):
+        """「网页」按钮：显式走浏览器搜索。"""
+        self._ask()
 
     # ---------------- mouse ----------------
     def enterEvent(self, e):
@@ -1638,6 +1868,8 @@ class DesktopPet(QWidget):
             "pat": m.addAction("揍一拳"),
             "feed": m.addAction("投喂数据饼干"),
             "status": m.addAction("看看状态"),
+            "credits": m.addAction("积分面板"),
+            "sync": m.addAction("立即同步积分"),
         }
         m.addSeparator()
         walk = m.addAction("到处走走")
@@ -1675,6 +1907,10 @@ class DesktopPet(QWidget):
                 self.feed()
             elif key == "status":
                 self.show_status()
+            elif key == "credits":
+                self.show_credits()
+            elif key == "sync":
+                self._sync_credits(manual=True)
             elif key == "walk":
                 self.walk_enabled = a.isChecked()
                 if not self.walk_enabled:

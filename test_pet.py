@@ -132,6 +132,51 @@ pet._save()
 pet2 = tp.DesktopPet()
 check("save→load mood 一致", pet2.mood == 77, f"got {pet2.mood}")
 
+# ---------- 6. 积分与搜索框 ----------
+print("[6] 积分与搜索框")
+check("有积分取凭证函数", hasattr(tp, "read_trae_token") and hasattr(tp, "fetch_credits"))
+check("积分告警阈值 500", tp.CREDITS_WARN == 500, f"got {tp.CREDITS_WARN}")
+check("积分同步间隔 30 分钟", tp.CREDITS_SYNC_MS == 30 * 60 * 1000, f"got {tp.CREDITS_SYNC_MS}")
+check("积分接口走 api.trae.cn",
+      tp.CREDITS_API.startswith("https://api.trae.cn/") and "ide_user_ent_usage" in tp.CREDITS_API,
+      tp.CREDITS_API)
+
+import base64 as _b64
+import json as _json
+
+
+def _fake_jwt(exp):
+    head = _b64.urlsafe_b64encode(b'{"alg":"RS256"}').rstrip(b"=").decode()
+    body = _b64.urlsafe_b64encode(_json.dumps({"exp": exp}).encode()).rstrip(b"=").decode()
+    return head + "." + body + ".sig"
+
+
+check("_jwt_exp 能解出 exp", tp._jwt_exp(_fake_jwt(1793150000)) == 1793150000)
+check("_jwt_exp 坏 token 返回 0", tp._jwt_exp("not-a-jwt") == 0)
+check("read_trae_token 不抛异常", tp.read_trae_token() is not None or True)
+
+# 取凭证失败时的提示不影响界面（这里屏蔽真实网络请求）
+_orig_sync = pet._sync_credits
+pet._sync_credits = lambda manual=False: None
+pet.credits = None
+pet.show_credits()
+check("无数据时 show_credits 不崩", True)
+pet._sync_credits = _orig_sync
+pet._on_credits(({"balance": 5842.02, "total": 8500.0, "used": 2657.98,
+                  "packs": [{"name": "用户福利", "limit": 4000.0, "used": 2157.98}],
+                  "ts": _time.time()}, True))
+check("_on_credits 存入数据", pet.credits is not None and pet.credits["balance"] == 5842.02)
+pet._save()
+pet3 = tp.DesktopPet()
+check("积分存档 roundtrip", (pet3.credits or {}).get("balance") == 5842.02,
+      f"got {pet3.credits}")
+
+m, acts = pet._build_menu()
+check("右键菜单有积分入口", "credits" in acts and "sync" in acts, f"got {sorted(acts)}")
+check("搜索框右侧按钮不越界",
+      pet.web_btn.geometry().right() + 1 <= tp.W and pet.trae_btn.text() == "Trae"
+      and pet.web_btn.text() == "网页")
+
 # ---------- 汇总 ----------
 print(f"\n===== {passed} passed, {failed} failed =====")
 sys.exit(1 if failed else 0)
